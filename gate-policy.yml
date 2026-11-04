@@ -1,0 +1,10 @@
+# Release gate policy — the acceptance criteria a candidate model must meet
+# before it may be packaged and released. Changing this file is a change to
+# the release rules, so it goes through the same pipeline (commit -> run).
+#
+# Metrics are measured on the pinned holdout set (6,000 transactions, ~4% fraud).
+gate:
+  pr_auc:
+    min: 0.30      # precision-recall AUC: how well the model ranks the rare fraud cases
+  accuracy:
+    min: 0.95      # share of all predictions that are correct

@@ -1,0 +1,108 @@
+# DATA 789 · Unit 11 — an ML release pipeline as a DAG of jobs.
+#   1 test -> 2 validate data -> 3 train -> 4 EVALUATION GATE -> 5 package -> 6 staged release
+# Every arrow is a `needs:` dependency. If the gate fails, 5 and 6 never run.
+name: ml-release-pipeline
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "Training scenario"
+        type: choice
+        options: [good, bad_data, lazy_model]
+        default: good
+      gate_metric:
+        description: "Metric the evaluation gate checks"
+        type: choice
+        options: [pr_auc, accuracy]
+        default: pr_auc
+
+permissions:
+  contents: read
+
+env:
+  SCENARIO: ${{ inputs.scenario || 'good' }}
+  GATE_METRIC: ${{ inputs.gate_metric || 'pr_auc' }}
+
+jobs:
+  test:
+    name: "1 · Unit tests"
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: pip install -r requirements.txt
+      - run: python -m pytest -q
+
+  validate-data:
+    name: "2 · Validate data (schema)"
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: pip install -r requirements.txt
+      - run: python -m pipeline.validate_data --scenario "$SCENARIO"
+
+  train:
+    name: "3 · Train candidate"
+    needs: validate-data
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: pip install -r requirements.txt
+      - run: python -m pipeline.train --scenario "$SCENARIO" --out out
+      - uses: actions/upload-artifact@v4
+        with: { name: candidate-model, path: out/ }
+
+  gate:
+    name: "4 · Evaluation gate"
+    needs: train
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: pip install -r requirements.txt
+      - uses: actions/download-artifact@v4
+        with: { name: candidate-model, path: out/ }
+      - name: Run the gate
+        run: python -m pipeline.evaluate_gate --model-dir out --metric "$GATE_METRIC"
+      - name: Keep the release record (pass OR block)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: release-record, path: out/release-record.json }
+
+  package:
+    name: "5 · Package image"
+    needs: gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: candidate-model, path: out/ }
+      - run: docker build -t trustbank-fraud:${{ github.sha }} .
+      - name: Smoke test the image
+        run: |
+          docker run -d --name svc -p 8000:8000 trustbank-fraud:${{ github.sha }}
+          for i in $(seq 1 20); do curl -fsS localhost:8000/health && break; sleep 1; done
+          curl -fsS -X POST localhost:8000/predict -H 'content-type: application/json' \
+               -d '{"features":[2.5,1.0,-1.0,0.5,0.0,0.0]}'
+
+  release:
+    name: "6 · Staged release (simulated)"
+    needs: package
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Canary 10% -> watch -> 100%
+        run: |
+          echo "Gate passed and image packaged — releasing in stages."
+          echo "Stage 1: route 10% of traffic to the new model (canary). Watch error rate + score drift."
+          echo "Stage 2: healthy -> route 100%. Unhealthy -> roll back (same idea as Unit 10's rollout)."
+          echo "Simulated: no cloud resources are touched in this lab."
